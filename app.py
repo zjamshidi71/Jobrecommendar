@@ -11,13 +11,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 st.set_page_config(page_title="JobMatcher Pro", layout="centered")
 
 
-# Keys come from Streamlit secrets, never from the code.
-try:
-    APP_ID = st.secrets["c439c644"]
-    APP_KEY = st.secrets["01163d7f667bc6da157e36a54a5e2abd"]
-except (KeyError, FileNotFoundError):
-    st.error("Adzuna keys are missing. Add ADZUNA_APP_ID and ADZUNA_APP_KEY in your app's Secrets settings.")
-    st.stop()
+# Your Adzuna keys. Keep the quotes around each value.
+APP_ID = "c439c644"
+APP_KEY = "01163d7f667bc6da157e36a54a5e2abd"
 
 
 def preprocess_text(text):
