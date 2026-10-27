@@ -1,5 +1,3 @@
-python
-Copy code
 import streamlit as st
 import requests
 import numpy as np
