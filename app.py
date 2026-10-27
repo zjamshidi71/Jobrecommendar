@@ -1,124 +1,134 @@
-import streamlit as st
-import requests
+import re
+from io import BytesIO
+
 import numpy as np
-import PyPDF2
+import requests
+import streamlit as st
+from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MinMaxScaler
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
-import string
 
-# Initialize NLTK resources
-nltk.download('punkt')
-nltk.download('stopwords')
-nltk.download('wordnet')
-# Streamlit page configuration
 st.set_page_config(page_title="JobMatcher Pro", layout="centered")
+
+
+# Keys come from Streamlit secrets, never from the code.
+try:
+    APP_ID = st.secrets["ADZUNA_APP_ID"]
+    APP_KEY = st.secrets["ADZUNA_APP_KEY"]
+except (KeyError, FileNotFoundError):
+    st.error("Adzuna keys are missing. Add ADZUNA_APP_ID and ADZUNA_APP_KEY in your app's Secrets settings.")
+    st.stop()
+
+
+def preprocess_text(text):
+    # Lowercase and strip punctuation; stop words are removed by the vectorizer.
+    return re.sub(r"[^a-z0-9+#\s]", " ", (text or "").lower())
+
+
+# Cached so moving a slider doesn't call the API again (saves your quota).
+@st.cache_data(ttl=3600, show_spinner="Searching Adzuna...")
+def fetch_jobs(keywords, location="Calgary", min_salary=None, full_time=True):
+    url = "https://api.adzuna.com/v1/api/jobs/ca/search/1"
+    params = {
+        "app_id": APP_ID,
+        "app_key": APP_KEY,
+        "results_per_page": 50,
+        "what": keywords,
+    }
+    if location:
+        params["where"] = location
+    if min_salary:
+        params["salary_min"] = min_salary
+    if full_time:
+        params["full_time"] = 1
+    response = requests.get(url, params=params, timeout=20)
+    if response.status_code != 200:
+        raise RuntimeError(f"Adzuna returned {response.status_code}: {response.text[:200]}")
+    return response.json().get("results", [])
+
+
+@st.cache_data
+def read_resume(file_bytes):
+    reader = PdfReader(BytesIO(file_bytes))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def get_recommendations(jobs, resume_text, ratings, top_n=10, feedback_strength=0.5):
+    """Rank jobs by similarity to the resume, adjusted by the user's ratings.
+
+    A rating above 3 pulls up jobs similar to the rated job; below 3 pushes them down.
+    """
+    docs = [preprocess_text(f"{j['title']} {j['description']}") for j in jobs]
+    query = preprocess_text(resume_text)
+    X = TfidfVectorizer(stop_words="english", sublinear_tf=True).fit_transform(docs + [query])
+    job_vecs, query_vec = X[:-1], X[-1]
+
+    scores = cosine_similarity(job_vecs, query_vec).ravel()
+
+    if ratings:
+        job_sim = cosine_similarity(job_vecs)  # job-to-job similarity
+        for idx, rating in ratings.items():
+            weight = (rating - 3) / 2  # 1 -> -1, 3 -> 0, 5 -> +1
+            scores = scores + feedback_strength * weight * job_sim[:, idx]
+
+    order = np.argsort(-scores)
+    rated = set(ratings)
+    return [(jobs[i], scores[i]) for i in order if i not in rated][:top_n]
+
+
+def show_job(job):
+    st.markdown(f"**{job['title']}**")
+    company = job.get("company", {}).get("display_name", "")
+    location = job.get("location", {}).get("display_name", "")
+    st.caption(" · ".join(x for x in [company, location] if x))
+    st.write(job["description"][:250] + "...")
+    st.markdown(f"[Apply here]({job['redirect_url']})")
+
+
+# ---- Layout ----
 st.title("🔍 JobMatcher Pro")
 st.write("Find jobs that match your skills and interests!")
 
-# Step 1: Function to process text
-def preprocess_text(text):
-    text = text.lower()
-    text = text.translate(str.maketrans('', '', string.punctuation))
-    tokens = word_tokenize(text)
-    stop_words = set(stopwords.words('english'))
-    filtered_tokens = [w for w in tokens if not w in stop_words]
-    lemmatizer = WordNetLemmatizer()
-    lemmatized_tokens = [lemmatizer.lemmatize(w) for w in filtered_tokens]
-    return ' '.join(lemmatized_tokens)
+st.subheader("Enter your job search criteria")
+keywords = st.text_input("Keywords or fields of interest", placeholder="e.g., Data Science, Machine Learning, AI")
+col1, col2 = st.columns(2)
+location = col1.text_input("Location", value="Calgary")
+full_time = col2.checkbox("Full-time only", value=True)
 
-# Step 2: Fetch jobs from Adzuna API
-def fetch_ai_jobs(app_id, app_key, location="Calgary", min_salary=0, max_salary=None, full_time=1, keywords="AI"):
-    base_url = "http://api.adzuna.com/v1/api/jobs/ca/search/1"
-    params = {
-        "app_id": "c439c644",
-        "app_key": "01163d7f667bc6da157e36a54a5e2abd",
-        "results_per_page": 50,
-        "what": keywords,
-        "where": location,
-        "salary_min": min_salary,
-        "content-type": "application/json"
-    }
-    if max_salary is not None:
-        params["salary_max"] = max_salary
-    if full_time is not None:
-        params["full_time"] = full_time
-    response = requests.get(base_url, params=params)
-    return response.json()['results'] if response.status_code == 200 else []
+st.subheader("Upload your resume")
+uploaded_file = st.file_uploader("Upload a PDF of your resume", type="pdf")
 
-# Step 3: Vectorize job descriptions and user query
-def vectorize_texts(texts):
-    vectorizer = TfidfVectorizer()
-    return vectorizer.fit_transform(texts), vectorizer
+if not (uploaded_file and keywords):
+    st.info("Please enter your search criteria and upload your resume.")
+    st.stop()
 
-# Step 4: Get Top 10 Recommendations with Feedback Scoring
-def get_recommendations(jobs, user_query, feedback_weights=None):
-    processed_query = preprocess_text(user_query)
-    preprocessed_descriptions = [preprocess_text(job['description']) for job in jobs]
-    texts_vectorized, vectorizer = vectorize_texts(preprocessed_descriptions + [processed_query])
-    user_query_vector = texts_vectorized[-1]
-    job_vectors = texts_vectorized[:-1]
-    cos_similarities = cosine_similarity(job_vectors, user_query_vector).flatten()
-    scaler = MinMaxScaler()
-    cos_similarities_scaled = scaler.fit_transform(cos_similarities.reshape(-1, 1)).flatten()
+resume_text = read_resume(uploaded_file.getvalue())
+if not resume_text.strip():
+    st.error("No text could be read from that PDF. It may be a scanned image.")
+    st.stop()
 
-    if feedback_weights is not None:
-        weighted_similarities = cos_similarities_scaled * feedback_weights
-    else:
-        weighted_similarities = cos_similarities_scaled
+try:
+    jobs = fetch_jobs(keywords, location, full_time=full_time)
+except Exception as e:
+    st.error(f"Job search failed: {e}")
+    st.stop()
 
-    top_matches = weighted_similarities.argsort()[-10:][::-1]
-    return [jobs[i] for i in top_matches]
+if not jobs:
+    st.error("No jobs found with the specified criteria.")
+    st.stop()
 
-# Streamlit App Layout
-st.subheader("Enter Your Job Search Criteria")
-keywords = st.text_input("Keywords or Fields of Interest", placeholder="e.g., Data Science, Machine Learning, AI")
+st.success(f"Found {len(jobs)} job listings matching '{keywords}'.")
 
-st.subheader("Upload Your Resume")
-uploaded_file = st.file_uploader("Upload a PDF file of your resume", type="pdf")
+st.subheader("Rate a few jobs")
+st.caption("3 is neutral. Higher ratings pull similar jobs up; lower ratings push them down.")
+ratings = {}
+for i, job in enumerate(jobs[:3]):
+    with st.container(border=True):
+        show_job(job)
+        # A unique key per job avoids Streamlit's duplicate-widget error.
+        ratings[i] = st.slider("Your rating", 1, 5, 3, key=f"rate_{job['id']}")
 
-if uploaded_file and keywords:
-    pdf_reader = PyPDF2.PdfFileReader(uploaded_file)
-    resume_text = ""
-    for page in range(pdf_reader.getNumPages()):
-        resume_text += pdf_reader.getPage(page).extractText()
- # Fetch jobs based on keywords
-    app_id = "your_app_id"   # Replace with your Adzuna app_id
-    app_key = "your_app_key" # Replace with your Adzuna app_key
-    jobs = fetch_ai_jobs(app_id, app_key, keywords=keywords)
-
-    if jobs:
-        st.success(f"Found {len(jobs)} job listings matching '{keywords}'.")
-
-        # Initial feedback on first 3 jobs
-        st.subheader("Rate Initial Job Suggestions")
-        user_feedback = []
-        for i, job in enumerate(jobs[:3]):
-            st.write(f"**Job #{i+1}**")
-            st.write(f"**Title:** {job['title']}")
-            st.write(f"**Location:** {', '.join(job['location']['area'])}")
-            st.write(f"**Description:** {job['description'][:250]}...")
-            st.write(f"[Apply here]({job['redirect_url']})")
-            rating = st.slider(f"Rate this job (1-5)", 1, 5, 3)
-            user_feedback.append(rating)
-
-        # Normalize feedback and get top recommendations
-        feedback_weights = np.array(user_feedback) / np.max(user_feedback) if user_feedback else None
-        recommendations = get_recommendations(jobs, resume_text, feedback_weights)
-
-        # Display Top 10 Recommendations
-        st.subheader("Top Job Matches Based on Your Profile")
-        for job in recommendations:
-            st.write("----")
-            st.write(f"**Title:** {job['title']}")
-            st.write(f"**Location:** {', '.join(job['location']['area'])}")
-            st.write(f"**Description:** {job['description'][:250]}...")
-            st.write(f"[Apply here]({job['redirect_url']})")
-    else:
-        st.error("No jobs found with the specified criteria.")
-else:
-    st.info("Please enter your job search criteria and upload your resume.")
+st.subheader("Top job matches for your profile")
+for job, score in get_recommendations(jobs, resume_text, ratings):
+    st.divider()
+    show_job(job)
