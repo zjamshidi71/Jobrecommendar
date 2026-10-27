@@ -1,6 +1,5 @@
 streamlit
-PyPDF2
 requests
 numpy
 scikit-learn
-nltk
+pypdf
